@@ -187,20 +187,25 @@ Join a room to receive location updates from other active users. After joining, 
 **Emit:**
 
 ```typescript
-socket.emit("join-room", roomId: string);
-```
-
-**Example:**
-
-```typescript
+// Solo mode (default) — see other solo runners
 socket.emit("join-room", "central-park-runners");
+// OR
+socket.emit("join-room", { roomId: "central-park-runners" });
+
+// Team mode — see ALL team runners (across all teams)
+socket.emit("join-room", { roomId: "central-park-runners", teamId: 5 });
 ```
 
 | Parameter | Type     | Required | Description                          |
 |-----------|----------|----------|--------------------------------------|
 | `roomId`  | `string` | ✅       | Any unique string identifier for the room |
+| `teamId`  | `number` | ❌       | If provided, join in team mode (see all team runners). If omitted, join in solo mode. |
 
-**Server Response:** Emits `location:snapshot` with all currently active users in the room.
+> 💡 **Visibility isolation:** Solo viewers only see solo runners. Team viewers see ALL team runners (from any team). The `teamId` in the payload is used to determine the viewer's mode — once in team mode, you see all team runners regardless of their specific team.
+
+**Server Response:** Emits `location:snapshot` with active users matching your mode (solo or team).
+
+**Backward Compatibility:** Passing a plain string (instead of an object) defaults to solo mode.
 
 **Error Handling:** If `roomId` is empty/falsy, the request is **silently ignored** (no error emitted).
 
@@ -216,31 +221,33 @@ Start a running session to begin broadcasting your location to other users in th
 socket.emit("start-session", {
   roomId: string,
   sessionId: number,
-  sessionMode?: "normal" | "ghost" | "private"  // Optional, defaults to "normal"
+  sessionMode?: "normal" | "ghost" | "private",  // Optional, defaults to "normal"
+  teamId?: number                                 // Optional — if provided, runs in team mode
 });
 ```
 
 **Example:**
 
 ```typescript
-// Normal mode (default) — location is shared with the room
+// Solo run (default) — location is shared with other solo runners
 socket.emit("start-session", {
   roomId: "central-park-runners",
   sessionId: 12345
 });
 
-// Ghost mode — Location is NOT broadcast to the room, but the session STILL captures territory
+// Team run — location is shared with ALL team runners (any team)
 socket.emit("start-session", {
   roomId: "central-park-runners",
   sessionId: 12345,
-  sessionMode: "ghost"
+  teamId: 5
 });
 
-// Private mode — Location is NOT broadcast to the room, and the session SKIPS territory capture
+// Ghost mode + team — invisible but captures territory for team 5
 socket.emit("start-session", {
   roomId: "central-park-runners",
   sessionId: 12345,
-  sessionMode: "private"
+  sessionMode: "ghost",
+  teamId: 5
 });
 ```
 
@@ -249,12 +256,13 @@ socket.emit("start-session", {
 | `roomId`      | `string` | ✅       | Must match the room you joined earlier         |
 | `sessionId`   | `number` | ✅       | Session ID obtained from your Express backend  |
 | `sessionMode` | `string` | ❌       | `"normal"` (default), `"ghost"`, or `"private"`. Ghost and private suppress all room broadcasts. |
+| `teamId`      | `number` | ❌       | If provided, the session runs in **team mode** — the user's location is only broadcast to other team runners. If omitted, the session runs in **solo mode**. |
 
 **What happens internally:**
 1. If this socket was attached to a different session, it is **detached** from the previous one.
 2. If the user already has an active session in this room (e.g., from another device), the socket is **added** to the existing session's socket set.
 3. Any pending reconnect timer is **cancelled**.
-4. The socket joins the Socket.IO room `room:{roomId}`.
+4. The socket joins a **sub-room** based on the session type: `room:{roomId}:solo` (solo) or `room:{roomId}:team` (team). This ensures solo and team runners are **completely isolated** from each other.
 5. If `sessionMode` is `"ghost"` or `"private"`, the user enters **stealth mode** — see [Session Modes](#-session-modes) below.
 
 **Error Handling:** If `roomId` or `sessionId` is missing, the request is **silently ignored**.

@@ -1,5 +1,141 @@
 # Changelog
 
+## [2026-05-18] — Team Mode: Solo/Team Visibility Isolation
+
+### ✨ New Features
+
+#### Team Mode for Running Sessions
+
+Users can now run in **team mode** or **solo mode**. The two modes are completely isolated — solo runners only see other solo runners, and team runners see all other team runners (across all teams).
+
+**How it works:**
+
+- **Solo mode** (default): No `teamId` provided. The user joins sub-room `room:{roomId}:solo` and only sees other solo runners.
+- **Team mode**: `teamId` provided. The user joins sub-room `room:{roomId}:team` and sees **all** team runners (from any team, not just their own). The specific `teamId` is included in broadcast payloads so the frontend can distinguish teams.
+
+**Sub-room isolation:** Instead of one shared Socket.IO room per geographical area, there are now two sub-rooms:
+- `room:{roomId}:solo` — solo runners
+- `room:{roomId}:team` — all team runners
+
+This means `location:update`, `user:offline`, `user:online`, `location:snapshot`, and `user:hype` events are **isolated by mode**. A solo runner will never see a team runner's marker, and vice versa.
+
+#### Updated `join-room` Event
+
+`join-room` now accepts either a plain string (backward compatible, defaults to solo) or an object:
+
+```typescript
+// Solo (backward compatible)
+socket.emit("join-room", "downtown");
+
+// Solo (explicit object)
+socket.emit("join-room", { roomId: "downtown" });
+
+// Team mode — see all team runners
+socket.emit("join-room", { roomId: "downtown", teamId: 5 });
+```
+
+#### Updated `start-session` Event
+
+`start-session` now accepts an optional `teamId`:
+
+```typescript
+// Solo run
+socket.emit("start-session", { roomId: "downtown", sessionId: 123 });
+
+// Team run — broadcasts only to team sub-room
+socket.emit("start-session", { roomId: "downtown", sessionId: 123, teamId: 5 });
+
+// Ghost + team — invisible but captures territory for team 5
+socket.emit("start-session", { roomId: "downtown", sessionId: 123, sessionMode: "ghost", teamId: 5 });
+```
+
+#### `teamId` in Broadcast Payloads
+
+For team-mode runners, all outgoing events (`location:update`, `location:snapshot`, `user:online`) include a `teamId` field so the frontend can render team-specific UI (colors, labels, etc.):
+
+```json
+{ "userId": 3, "lat": 40.78, "lng": -73.96, "ts": 1706636270000, "avatarUrl": "...", "teamId": 5 }
+```
+
+For solo runners, `teamId` is **not included** in payloads (unchanged behavior).
+
+#### Hype Isolation
+
+`user:hype` is isolated by session type. Solo runners can only hype other solo runners, and team runners can only hype other team runners.
+
+### 📱 Frontend Action Required
+
+1. **Choose mode before joining:** Call `join-room` with `{ roomId, teamId }` for team mode, or plain `roomId` string for solo mode.
+2. **Pass `teamId` in `start-session`:** If the user selected a team, include `teamId` in the payload.
+3. **Handle `teamId` in events:** `location:snapshot`, `location:update`, and `user:online` payloads now include `teamId` for team runners. Use it for team-specific rendering (colors, labels, etc.).
+4. **No changes for solo mode:** Existing solo-mode clients are fully backward compatible.
+
+### 🔧 What Does NOT Change
+
+- **Redis path storage** — `session:{id}:path` is unchanged (team-agnostic)
+- **Avatar handling** — same `user:{userId}:avatar` key for both modes
+- **Pause / Resume** — same events and logic
+- **Reconnect / Grace period** — `sessionType` and `teamId` are preserved in memory
+- **Session modes (ghost/private)** — still work identically
+- **Buffered sync** — same mechanism
+
+---
+
+
+
+## [2026-04-27] — Active-Minute Counter for Per-Minute Speed Tracking
+
+### ✨ New Features
+
+#### `minute` field in `location:update`
+
+The `location:update` event now accepts an optional `minute` field — an active-minute counter maintained by the frontend. This enables the backend to compute per-minute average speed for detailed session analytics (speed-over-time charts, pace analysis, etc.).
+
+**How it works:**
+
+1. Frontend starts a counter at `1` when the session begins
+2. Counter increments by `1` every 60 seconds of **active running time**
+3. Counter **freezes** on pause and **resumes** on unpause
+4. Each `location:update` includes the current counter value
+5. The WS server passes it through to Redis alongside `lat`, `lng`, `ts`
+6. The backend groups path points by `minute` and computes speed per minute
+
+**Emit:**
+
+```typescript
+socket.emit("location:update", {
+  lat: 40.785091,
+  lng: -73.968285,
+  minute: 3   // 3rd active minute of the session
+});
+```
+
+**Redis data shape (unchanged key, new optional field):**
+
+```
+session:12345:path → [
+  '{"lat":40.785091,"lng":-73.968285,"ts":1706636270000,"minute":1}',
+  '{"lat":40.785120,"lng":-73.968300,"ts":1706636332000,"minute":2}',
+  ...
+]
+```
+
+> The `minute` field is optional and backward-compatible. If not sent, path entries look the same as before.
+
+### 📱 Frontend Action Required
+
+1. **Maintain an active-minute counter** — start at `1` on session start, increment every 60s
+2. **Freeze on pause** — clear the interval timer when emitting `session:pause`
+3. **Resume on unpause** — restart the interval timer when emitting `session:resume`
+4. **Include `minute` in every `location:update`** — `socket.emit("location:update", { lat, lng, minute })`
+
+### 🔧 Backend Action Required
+
+- **No changes to Redis keys** — the `minute` field is included in existing `session:{id}:path` entries
+- **Add speed computation** — when processing session paths, group points by `minute`, compute haversine distance per group, derive avg speed per minute
+
+---
+
 ## [2026-04-13] — Zero-Database WebSocket Authentication
 
 ###  Performance Improvements
