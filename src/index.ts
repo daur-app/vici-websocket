@@ -372,6 +372,41 @@ io.on("connection", (socket) => {
     socket.emit("location:snapshot", snapshot);
   });
 
+  socket.on("leave-room", (payload: string | { roomId: string; teamId?: number }) => {
+    const roomId = typeof payload === 'string' ? payload : payload?.roomId;
+    const teamId = typeof payload === 'object' ? (payload?.teamId ?? null) : null;
+    if (!roomId) return;
+
+    const sessionType: SessionType = teamId != null ? 'team' : 'solo';
+    const subRoom = getSubRoom(roomId, sessionType);
+
+    // Leave the Socket.IO sub-room
+    socket.leave(subRoom);
+
+    // If this socket has an active session in this room, clean it up
+    const active = activeBySocket.get(socket.id);
+    if (active && active.roomId === roomId) {
+      const roomMap = activeUsersByRoom.get(roomId);
+      const userData = roomMap?.get(active.userId);
+
+      if (userData) {
+        userData.sockets.delete(socket.id);
+
+        if (userData.sockets.size === 0) {
+          // Broadcast offline before cleanup (skip for stealth modes)
+          if (!isStealthMode(userData.sessionMode)) {
+            io.to(subRoom).emit("user:offline", { userId: active.userId });
+          }
+          scheduleSessionCleanup(roomId, active.userId, userData);
+        }
+      }
+
+      activeBySocket.delete(socket.id);
+    }
+
+    socket.emit("room:left", { roomId });
+  });
+
   socket.on("start-session", ({ roomId, sessionId, sessionMode, teamId }: { roomId: string; sessionId: number; sessionMode?: string; teamId?: number }) => {
     if (!roomId || !sessionId) return;
     const mode: SessionMode = (sessionMode === 'ghost' || sessionMode === 'private') ? sessionMode : 'normal';

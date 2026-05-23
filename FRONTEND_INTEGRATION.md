@@ -23,6 +23,7 @@
 - [Important Notes](#-important-notes)
 - [Server Information](#-server-information)
 
+
 ---
 
 ## 📖 Overview
@@ -211,7 +212,42 @@ socket.emit("join-room", { roomId: "central-park-runners", teamId: 5 });
 
 ---
 
-### 2. `start-session`
+### 2. `leave-room`
+
+Leave a previously joined room. The socket is removed from the sub-room and stops receiving location updates and broadcasts from that room. If the socket had an active session in the room, it is cleaned up (same behavior as a disconnect for that room).
+
+**Emit:**
+
+```typescript
+// Solo mode — leave the solo sub-room
+socket.emit("leave-room", "central-park-runners");
+// OR
+socket.emit("leave-room", { roomId: "central-park-runners" });
+
+// Team mode — leave the team sub-room
+socket.emit("leave-room", { roomId: "central-park-runners", teamId: 5 });
+```
+
+| Parameter | Type     | Required | Description                          |
+|-----------|----------|----------|--------------------------------------|
+| `roomId`  | `string` | ✅       | The room to leave                    |
+| `teamId`  | `number` | ❌       | If provided, leave the team sub-room. If omitted, leave the solo sub-room. |
+
+**What happens internally:**
+1. The socket leaves the Socket.IO sub-room (`room:{roomId}:solo` or `room:{roomId}:team`).
+2. If this socket had an active session in that room, it is **detached** from the session.
+3. If no other sockets remain for that user's session, `user:offline` is broadcast and the session enters the reconnect grace period (same as disconnect).
+4. The session data is **not immediately destroyed** — the user can still reconnect within `SESSION_RESUME_WINDOW_MS`.
+
+**Server Response:** Emits `room:left` with `{ roomId }` as acknowledgement.
+
+**Backward Compatibility:** Passing a plain string (instead of an object) defaults to solo mode (same as `join-room`).
+
+**Error Handling:** If `roomId` is empty/falsy, the request is **silently ignored** (no error emitted).
+
+---
+
+### 3. `start-session`
 
 Start a running session to begin broadcasting your location to other users in the room.
 
@@ -269,7 +305,7 @@ socket.emit("start-session", {
 
 ---
 
-### 3. `location:update`
+### 4. `location:update`
 
 Send your current GPS location. **Only works after `start-session`** — if no active session exists for this socket, the update is silently ignored.
 
@@ -322,7 +358,7 @@ socket.emit("location:update", {
 
 ---
 
-### 4. `end-session`
+### 5. `end-session`
 
 End your running session. Stops broadcasting your location and notifies other users.
 
@@ -343,7 +379,7 @@ socket.emit("end-session");
 
 ---
 
-### 5. `reconnect-session`
+### 6. `reconnect-session`
 
 Attempt to resume a previously active session after a disconnection. This must be called within the **reconnect grace period** (`SESSION_RESUME_WINDOW_MS`, default 48 hours).
 
@@ -381,7 +417,7 @@ socket.emit("reconnect-session", {
 
 ---
 
-### 6. `location:sync-buffered`
+### 7. `location:sync-buffered`
 
 Send buffered location points that were collected while the socket was disconnected. **Must be called after a successful `reconnect-session`** — the socket needs an active session.
 
@@ -419,7 +455,7 @@ socket.emit("location:sync-buffered", {
 
 ---
 
-### 7. `session:pause`
+### 8. `session:pause`
 
 Pause the current running session. The user will be treated as **offline** — their marker is removed for other users, and any `location:update` events sent while paused are **silently rejected**. The session stays alive (it is NOT ended), and the socket remains connected.
 
@@ -443,7 +479,7 @@ socket.emit("session:pause");
 
 ---
 
-### 8. `session:resume`
+### 9. `session:resume`
 
 Resume a paused session. The user becomes online again — location updates are accepted, and other users are notified.
 
@@ -467,7 +503,7 @@ socket.emit("session:resume");
 
 ---
 
-### 9. `discard-session` (or `discard-sesion`)
+### 10. `discard-session` (or `discard-sesion`)
 
 Completely discard and delete the current running session's location data from Redis, and end the session. Stops broadcasting your location and removes your data from the server.
 
@@ -487,7 +523,7 @@ socket.emit("discard-session");
 
 ---
 
-### 10. `user:hype`
+### 11. `user:hype`
 
 Send a "hype" (highfive) to a specific user in the room.
 
@@ -765,6 +801,7 @@ interface UserHype {
 | Event | Direction | Payload (Input) | Response/Broadcast | When to Use |
 |-------|-----------|------------------|--------------------|-------------|
 | `join-room` | Client → Server | `roomId: string` | `location:snapshot` → caller | After connecting, join a tracking room |
+| `leave-room` | Client → Server | `roomId: string` or `{ roomId, teamId? }` | `room:left` → caller, `user:offline` → room ¹ | Leave a previously joined room |
 | `start-session` | Client → Server | `{ roomId, sessionId, sessionMode? }` | — | When user starts a running session |
 | `location:update` | Client → Server | `{ lat, lng, minute? }` | `location:update` → room (others) ¹ | During active session, share GPS location |
 | `end-session` | Client → Server | *none* | `user:offline` → room (others) ¹ | When user ends running session |
@@ -776,12 +813,13 @@ interface UserHype {
 | **`session:resume`** | **Client → Server** | ***none*** | **`session:resumed-active` → caller, `user:online` → room** ¹ | **Resume sharing location after pause** |
 | `location:snapshot` | Server → Client | — | `[{ userId, lat, lng, ts, avatarUrl }, ...]` | Sent after `join-room` (only connected, unpaused, non-stealth users) |
 | `location:update` | Server → Client | — | `{ userId, lat, lng, ts, avatarUrl }` | Real-time location from other users |
-| `user:offline` | Server → Client | — | `{ userId }` | **Immediately** when a user disconnects, ends session, or **pauses** ¹ |
+| `user:offline` | Server → Client | — | `{ userId }` | **Immediately** when a user disconnects, ends session, leaves room, or **pauses** ¹ |
 | `user:online` | Server → Client | — | `{ userId, lat, lng, ts, avatarUrl }` | When a disconnected user reconnects or **resumes** ¹ |
 | `session:resumed` | Server → Client | — | `{ roomId, sessionId, location, disconnectedAt }` | Successful session reconnection |
 | `session:resume-failed` | Server → Client | — | `{ reason }` | Failed session reconnection |
 | `session:paused` | Server → Client | — | `{ sessionId }` | Acknowledgement that session is paused |
 | `session:resumed-active` | Server → Client | — | `{ sessionId }` | Acknowledgement that session is resumed from pause |
+| `room:left` | Server → Client | — | `{ roomId }` | Acknowledgement that the room was left |
 | `location:sync-ack` | Server → Client | — | `{ count }` | Confirmation of buffered sync |
 | `user:hype` | Server → Client | — | `{ senderId, targetUserId }` | A user sent a hype to someone |
 
@@ -962,7 +1000,10 @@ interface SocketAuth {
 // ============ CLIENT → SERVER EVENTS ============
 
 // join-room
-type JoinRoomPayload = string;  // roomId
+type JoinRoomPayload = string | { roomId: string; teamId?: number };
+
+// leave-room
+type LeaveRoomPayload = string | { roomId: string; teamId?: number };
 
 // start-session
 type SessionMode = 'normal' | 'ghost' | 'private';
@@ -1055,6 +1096,11 @@ interface SyncBufferedPayload {
 interface SyncAckPayload {
   count: number;
 }
+
+// room:left
+interface RoomLeftPayload {
+  roomId: string;
+}
 ```
 
 ---
@@ -1094,9 +1140,24 @@ class ViciSocketService {
 
   // ── Room ────────────────────────────────────────────
 
-  joinRoom(roomId: string): void {
+  joinRoom(roomId: string, teamId?: number): void {
     this.currentRoom = roomId;
-    this.socket?.emit("join-room", roomId);
+    if (teamId != null) {
+      this.socket?.emit("join-room", { roomId, teamId });
+    } else {
+      this.socket?.emit("join-room", roomId);
+    }
+  }
+
+  leaveRoom(roomId: string, teamId?: number): void {
+    if (teamId != null) {
+      this.socket?.emit("leave-room", { roomId, teamId });
+    } else {
+      this.socket?.emit("leave-room", roomId);
+    }
+    if (this.currentRoom === roomId) {
+      this.currentRoom = null;
+    }
   }
 
   // ── Session ─────────────────────────────────────────
@@ -1270,7 +1331,7 @@ async function main() {
 
 ## ⚠️ Important Notes
 
-1. **Order Matters** — Always `join-room` before `start-session`
+1. **Order Matters** — Always `join-room` before `start-session`. Use `leave-room` to cleanly exit a room without disconnecting the socket.
 2. **Local Path Storage** — Store your own location updates locally for path rendering. The server stores them in Redis but doesn't send them back to you.
 3. **Reconnect Grace Period** — After disconnect, the session stays alive for **48 hours** (configurable via `SESSION_RESUME_WINDOW_MS`). Use `reconnect-session` within this window.
 4. **Session ID** — Must be obtained from your Express/REST backend before starting a session.

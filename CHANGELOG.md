@@ -1,5 +1,58 @@
 # Changelog
 
+## [2026-05-23] — Clean Room Departure via `leave-room`
+
+### ✨ New Features
+
+#### `leave-room` Event (Client → Server)
+
+Users can now cleanly exit a room without disconnecting their WebSocket connection using the `leave-room` event. This is useful when leaving a map screen but keeping the app open.
+
+**Emit:**
+
+```typescript
+// Solo mode (backward compatible)
+socket.emit("leave-room", "downtown");
+
+// Or using an object (Solo mode)
+socket.emit("leave-room", { roomId: "downtown" });
+
+// Team mode
+socket.emit("leave-room", { roomId: "downtown", teamId: 5 });
+```
+
+**What happens internally:**
+1. The socket immediately leaves the Socket.IO room (`room:{roomId}:solo` or `room:{roomId}:team`).
+2. If there was an active session in that room, the server cleans it up and immediately broadcasts a `user:offline` event to other users in the room (unless in ghost/private mode).
+3. The server emits a `room:left` event back to the caller for confirmation.
+4. The user's underlying socket connection remains open.
+
+#### `room:left` Event (Server → Client)
+
+Confirmation that the room was successfully left.
+
+**Listen:**
+
+```typescript
+socket.on("room:left", (data) => {
+  console.log(`Successfully left room ${data.roomId}`);
+});
+```
+
+**Payload:**
+
+```typescript
+interface RoomLeftPayload {
+  roomId: string;
+}
+```
+
+### 📱 Frontend Action Required
+
+- Use `leave-room` when the user navigates away from the map/territory view but you want to keep the WebSocket connection active.
+
+---
+
 ## [2026-05-18] — Team Mode: Solo/Team Visibility Isolation
 
 ### ✨ New Features
