@@ -59,4 +59,6 @@ jobs:
             -e CLERK_SECRET_KEY="${{ secrets.CLERK_SECRET_KEY }}" \
             -e DATABASE_URL="${{ secrets.DATABASE_URL }}" \
             -e REDIS_URL="${{ secrets.REDIS_URL }}" \
+            -e SENTRY_DSN="${{ secrets.SENTRY_DSN }}" \
+            -e NODE_ENV="production" \
             aniketjha4518/vicisocket:latest

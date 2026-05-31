@@ -1,1 +1,1 @@
-{"root":["./src/index.ts","./src/middelware/authmiddleware.ts","./src/redis/redis.ts","./src/types/socket.d.ts"],"version":"5.9.3"}
+{"root":["./src/index.ts","./src/instrument.ts","./src/handlers/locationhandlers.ts","./src/handlers/roomhandlers.ts","./src/handlers/sessionhandlers.ts","./src/handlers/socialhandlers.ts","./src/middelware/authmiddleware.ts","./src/redis/redis.ts","./src/session/lifecycle.ts","./src/session/pathbuffer.ts","./src/session/store.ts","./src/types/session.ts","./src/types/socket.d.ts"],"version":"5.9.3"}
