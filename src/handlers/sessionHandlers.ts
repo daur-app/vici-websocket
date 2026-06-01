@@ -143,7 +143,7 @@ export function registerSessionHandlers(io: Server, socket: Socket, userId: numb
 
     // Insert a segment break so pause→resume doesn't draw a false connecting line
     try {
-      await pushBreakMarker(active.sessionId);
+      await pushBreakMarker(active.sessionId, "pause");
     } catch (err) {
       console.error("Failed to push break marker on pause:", err);
       Sentry.captureException(err, {

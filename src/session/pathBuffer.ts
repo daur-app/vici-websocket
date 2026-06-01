@@ -75,8 +75,8 @@ export async function startFlushTimer(
  * The backend splits the path at these markers to get separate segments,
  * preventing false straight lines between pause→resume or disconnect→reconnect gaps.
  */
-export async function pushBreakMarker(sessionId: number): Promise<void> {
-  const marker = JSON.stringify({ type: "break", ts: Date.now() });
+export async function pushBreakMarker(sessionId: number, reason: "pause" | "disconnect" = "disconnect"): Promise<void> {
+  const marker = JSON.stringify({ type: "break", reason, ts: Date.now() });
   await redis
     .multi()
     .rpush(`session:${sessionId}:path`, marker)
