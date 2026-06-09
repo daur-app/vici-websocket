@@ -5,9 +5,9 @@
 
 import type { Server, Socket } from 'socket.io';
 import { Sentry } from '../instrument';
-import { redis } from '../redis/redis';
+import { redis, createRedisConnection } from '../redis/redis';
 import type { SessionMode, SessionType } from '../types/session';
-import { isStealthMode, SESSION_RESUME_WINDOW_MS } from '../types/session';
+import { isStealthMode, SESSION_RESUME_WINDOW_MS, REDIS_SESSION_KILLED_CHANNEL, REDIS_SESSION_FINALIZED_CHANNEL } from '../types/session';
 import {
   activeUsersByRoom,
   activeBySocket,
@@ -15,6 +15,7 @@ import {
   getSubRoom,
   clearReconnectTimer,
   clearFlushTimer,
+  findUserAcrossRooms,
 } from './store';
 import { flushPathBuffer, pushBreakMarker, startFlushTimer } from './pathBuffer';
 
@@ -34,18 +35,20 @@ export async function finalizeSession(roomId: string, userId: number): Promise<v
   const userData = roomMap?.get(userId);
   if (!roomMap || !userData) return;
 
+  const sessionId = userData.sessionId;
+
   clearReconnectTimer(userData);
   clearFlushTimer(userData);
 
   // Final flush — ensure any remaining buffered points are written to Redis
   // Must await so userData is not deleted while a flush is still in-flight
   try {
-    await flushPathBuffer(userData.sessionId, userData);
+    await flushPathBuffer(sessionId, userData);
   } catch (err) {
     console.error(`[Flush] Error on finalizeSession for user ${userId}:`, err);
     Sentry.captureException(err, {
       tags: { event: 'finalizeSession', phase: 'flush' },
-      extra: { userId, sessionId: userData.sessionId, roomId },
+      extra: { userId, sessionId, roomId },
     });
   }
 
@@ -56,7 +59,7 @@ export async function finalizeSession(roomId: string, userId: number): Promise<v
 
   Sentry.addBreadcrumb({
     category: 'session.lifecycle',
-    message: `finalizeSession: userId=${userId} sessionId=${userData.sessionId} roomId=${roomId} socketsRemoved=${userData.sockets.size}`,
+    message: `finalizeSession: userId=${userId} sessionId=${sessionId} roomId=${roomId} socketsRemoved=${userData.sockets.size}`,
     level: 'info',
   });
 
@@ -67,6 +70,22 @@ export async function finalizeSession(roomId: string, userId: number): Promise<v
 
   if (!isStealthMode(userData.sessionMode)) {
     io.to(getSubRoom(roomId, userData.sessionType)).emit("user:offline", { userId });
+  }
+
+  // Notify the backend that this session was finalized by the WS server.
+  // The backend should subscribe to this channel and trigger its completion
+  // pipeline (area calculation, territory capture, etc.) before Redis data expires.
+  try {
+    await redis.publish(
+      REDIS_SESSION_FINALIZED_CHANNEL,
+      JSON.stringify({ sessionId, userId, roomId }),
+    );
+  } catch (err) {
+    console.error(`[PubSub] Failed to publish session:finalized for session ${sessionId}:`, err);
+    Sentry.captureException(err, {
+      tags: { event: 'finalizeSession', phase: 'publish' },
+      extra: { userId, sessionId, roomId },
+    });
   }
 }
 
@@ -140,6 +159,20 @@ export async function attachSocketToSession(
     // Leave the previous sub-room before switching
     socket.leave(getSubRoom(previous.roomId, previous.sessionType));
     activeBySocket.delete(socket.id);
+  }
+
+  // ── BUG-006 FIX: Immediately finalize any stale session for this user ────
+  // If the user already has an in-memory session with a DIFFERENT sessionId,
+  // finalize it immediately instead of just scheduling cleanup. This prevents
+  // ghost sessions that could confuse reconnect-session lookups.
+  const existingAcrossRooms = findUserAcrossRooms(userId);
+  if (existingAcrossRooms && existingAcrossRooms.userData.sessionId !== sessionId) {
+    Sentry.addBreadcrumb({
+      category: 'session.lifecycle',
+      message: `BUG-006 FIX: Immediately finalizing stale session ${existingAcrossRooms.userData.sessionId} for userId=${userId} (new sessionId=${sessionId})`,
+      level: 'warning',
+    });
+    await finalizeSession(existingAcrossRooms.roomId, userId);
   }
 
   const roomMap = getOrCreateRoomMap(roomId);
@@ -256,4 +289,81 @@ export async function detachSocket(socketId: string): Promise<void> {
   }
 
   activeBySocket.delete(socketId);
+}
+
+// ─── Redis Pub/Sub: Backend → WS session kill notifications (BUG-004 FIX) ───
+
+/**
+ * Initialize a Redis Pub/Sub subscriber that listens for session-kill
+ * notifications from the backend. When the backend kills a session
+ * (e.g., via completeActiveSessionsForUser), it publishes to the
+ * 'session:killed' channel. The WS server receives the message and
+ * immediately finalizes the session in its in-memory state.
+ *
+ * This ensures the WS server is never out of sync with the backend's
+ * session state — resolving BUG-004.
+ */
+export function initSessionKilledSubscriber(): void {
+  // Use a dedicated Redis connection for subscriptions (required by ioredis)
+  const subscriber = createRedisConnection();
+
+  subscriber.subscribe(REDIS_SESSION_KILLED_CHANNEL, (err) => {
+    if (err) {
+      console.error(`[PubSub] Failed to subscribe to ${REDIS_SESSION_KILLED_CHANNEL}:`, err);
+      Sentry.captureException(err, {
+        tags: { event: 'initSessionKilledSubscriber' },
+      });
+      return;
+    }
+    console.log(`[PubSub] Subscribed to channel: ${REDIS_SESSION_KILLED_CHANNEL}`);
+  });
+
+  subscriber.on('message', async (channel, message) => {
+    if (channel !== REDIS_SESSION_KILLED_CHANNEL) return;
+
+    try {
+      const payload = JSON.parse(message) as { sessionId: number; userId: number };
+      const { sessionId, userId } = payload;
+
+      if (!sessionId || !userId) {
+        console.warn('[PubSub] Received session:killed with missing sessionId or userId:', message);
+        return;
+      }
+
+      Sentry.addBreadcrumb({
+        category: 'session.pubsub',
+        message: `Received session:killed: userId=${userId} sessionId=${sessionId}`,
+        level: 'warning',
+      });
+
+      // Find the user's active session in memory
+      const found = findUserAcrossRooms(userId);
+      if (!found) {
+        // Session might already be cleaned up or not on this WS instance
+        console.log(`[PubSub] session:killed for userId=${userId} sessionId=${sessionId} — not found in memory`);
+        return;
+      }
+
+      // Only finalize if the sessionId matches (don't kill a newer session)
+      if (found.userData.sessionId === sessionId) {
+        console.log(`[PubSub] Finalizing killed session ${sessionId} for userId=${userId}`);
+        await finalizeSession(found.roomId, userId);
+      } else {
+        console.log(`[PubSub] session:killed for sessionId=${sessionId} but user has sessionId=${found.userData.sessionId} — ignoring`);
+      }
+    } catch (err) {
+      console.error('[PubSub] Error processing session:killed message:', err);
+      Sentry.captureException(err, {
+        tags: { event: 'session:killed:handler' },
+        extra: { rawMessage: message },
+      });
+    }
+  });
+
+  subscriber.on('error', (err) => {
+    console.error('[PubSub] Subscriber error:', err);
+    Sentry.captureException(err, {
+      tags: { event: 'pubsub:subscriber:error' },
+    });
+  });
 }

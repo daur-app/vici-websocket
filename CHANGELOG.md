@@ -1,5 +1,76 @@
 # Changelog
 
+## [2026-06-07] — Session Reliability Fixes & Architecture Refactor
+
+### 🐛 Bug Fixes
+
+#### BUG-004: Backend → WS Session State Desynchronization
+
+When the backend killed a session (e.g., via `completeActiveSessionsForUser`), the WS server's in-memory state was never updated — leading to ghost sessions that confused reconnect logic.
+
+**Fix:** The WS server now subscribes to a Redis Pub/Sub channel (`session:killed`). When the backend publishes `{ sessionId, userId }`, the WS server immediately finalizes the matching in-memory session.
+
+**Backend action required:** Publish to `session:killed` when programmatically ending sessions:
+
+```typescript
+await redis.publish('session:killed', JSON.stringify({ sessionId, userId }));
+```
+
+#### BUG-005: Redis TTL Shorter Than Resume Window
+
+Redis path keys had a 48-hour TTL, matching the 48-hour resume window exactly. If a user reconnected near the end of the grace window, their data could have already expired.
+
+**Fix:** Redis TTL increased to **72 hours** (24h safety buffer beyond the 48h resume window).
+
+#### BUG-006: Ghost Sessions from Stale In-Memory State
+
+When `start-session` was called for a user who already had an in-memory session with a *different* `sessionId` (e.g., after a backend restart issued a new session), the old session lingered as a ghost.
+
+**Fix:** `attachSocketToSession` now checks for existing sessions with a mismatched `sessionId` across all rooms and **immediately finalizes** them before attaching the new session.
+
+### 🔧 Changes
+
+#### `session:resume` No Longer Broadcasts `user:online`
+
+Previously, resuming from pause would broadcast `user:online` with the user's pre-pause location. This could show a stale marker kilometers away from their actual position.
+
+**Now:** On resume, the last known location is **cleared**. The user reappears on the map only after sending their first `location:update` post-resume.
+
+#### `session:pause` Now Flushes Buffer + Inserts Break Marker
+
+Pausing now explicitly flushes the in-memory path buffer to Redis and inserts a segment break marker (`{"type":"break","reason":"pause"}`). This ensures:
+- No location data is lost on pause
+- The backend can split paths at break points to avoid false connecting lines
+
+#### Sentry Error Tracking
+
+Added `@sentry/node` integration for production error reporting. All critical paths (flush failures, Pub/Sub errors, session lifecycle issues) report to Sentry with structured breadcrumbs and context.
+
+New env vars: `SENTRY_DSN`, `NODE_ENV` (set to `production` to enable).
+
+### 🏗️ Architecture Refactor
+
+The monolithic `src/index.ts` has been split into focused modules:
+
+| Module | Responsibility |
+|--------|----------------|
+| `src/handlers/roomHandlers.ts` | `join-room`, `leave-room` |
+| `src/handlers/sessionHandlers.ts` | `start-session`, `reconnect-session`, `end-session`, `discard-session`, `session:pause`, `session:resume` |
+| `src/handlers/locationHandlers.ts` | `location:update`, `location:sync-buffered` |
+| `src/handlers/socialHandlers.ts` | `user:hype` |
+| `src/session/lifecycle.ts` | `attachSocketToSession`, `detachSocket`, `finalizeSession`, `scheduleSessionCleanup`, `initSessionKilledSubscriber` |
+| `src/session/store.ts` | In-memory Maps, lookup helpers |
+| `src/session/pathBuffer.ts` | Buffer flush, break markers |
+| `src/types/session.ts` | Shared types and constants |
+| `src/instrument.ts` | Sentry initialization |
+
+### 📱 Frontend Action Required
+
+- No frontend changes required for BUG-004/005/006 fixes — they are all server-side.
+- **`session:resume` behavior change:** After resuming, the user's marker will now appear only after their first GPS update (not immediately with stale pre-pause location). Ensure your app restarts location tracking promptly on resume.
+
+---
+
 ## [2026-05-23] — Clean Room Departure via `leave-room`
 
 ### ✨ New Features

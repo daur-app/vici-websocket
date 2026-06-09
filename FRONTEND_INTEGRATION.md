@@ -58,18 +58,20 @@ This WebSocket server (built with **Socket.IO**) enables real-time location shar
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `CLERK_SECRET_KEY` | ✅ Yes | — | Secret key used to verify Clerk tokens |
-| `DATABASE_URL` | ❌ No | — | Legacy Postgres connection URL (no longer required for WebSocket authentication) |
 | `REDIS_URL` | ❌ No | `localhost:6379` | Redis connection URL (supports `redis://` and `rediss://` for TLS) |
 | `SESSION_RESUME_WINDOW_MS` | ❌ No | `172800000` (48h) | Time (in ms) a disconnected session stays alive before cleanup |
 | `FLUSH_INTERVAL_MS` | ❌ No | `10000` (10s) | How often buffered location points are flushed to Redis (in ms) |
+| `SENTRY_DSN` | ❌ No | — | Sentry DSN for error tracking (disabled in development) |
+| `NODE_ENV` | ❌ No | `development` | Set to `production` to enable Sentry error reporting |
 
 **.env.example:**
 
 ```env
 REDIS_URL=redis://something:password@host:port/db
 CLERK_SECRET_KEY=sk_test_xxxxx
-DATABASE_URL=postgresql://user:pass@host:5432/dbname
-SESSION_RESUME_WINDOW_MS=30000
+SESSION_RESUME_WINDOW_MS=172800000
+SENTRY_DSN=https://xxx@sentry.io/xxx
+NODE_ENV=production
 ```
 
 ---
@@ -296,10 +298,11 @@ socket.emit("start-session", {
 
 **What happens internally:**
 1. If this socket was attached to a different session, it is **detached** from the previous one.
-2. If the user already has an active session in this room (e.g., from another device), the socket is **added** to the existing session's socket set.
-3. Any pending reconnect timer is **cancelled**.
-4. The socket joins a **sub-room** based on the session type: `room:{roomId}:solo` (solo) or `room:{roomId}:team` (team). This ensures solo and team runners are **completely isolated** from each other.
-5. If `sessionMode` is `"ghost"` or `"private"`, the user enters **stealth mode** — see [Session Modes](#-session-modes) below.
+2. If the user already has an active session with a **different sessionId** in any room, it is **immediately finalized** (prevents ghost sessions).
+3. If the user already has an active session in this room (e.g., from another device), the socket is **added** to the existing session's socket set.
+4. Any pending reconnect timer is **cancelled**.
+5. The socket joins a **sub-room** based on the session type: `room:{roomId}:solo` (solo) or `room:{roomId}:team` (team). This ensures solo and team runners are **completely isolated** from each other.
+6. If `sessionMode` is `"ghost"` or `"private"`, the user enters **stealth mode** — see [Session Modes](#-session-modes) below.
 
 **Error Handling:** If `roomId` or `sessionId` is missing, the request is **silently ignored**.
 
@@ -468,10 +471,12 @@ socket.emit("session:pause");
 
 **What happens internally:**
 1. The user's session is flagged as `paused = true`.
-2. A `user:offline` event is broadcast to other users in the room — markers removed (skipped in ghost/private mode).
-3. Any incoming `location:update` events are **silently rejected** while paused.
-4. The user is **excluded from `location:snapshot`** results while paused.
-5. A `session:paused` acknowledgement is sent back to the caller.
+2. The in-memory path buffer is **flushed** to Redis (ensures pre-pause locations are persisted).
+3. A **segment break marker** (`{"type":"break","reason":"pause"}`) is inserted into the Redis path (prevents false connecting lines between pause→resume).
+4. A `user:offline` event is broadcast to other users in the room — markers removed (skipped in ghost/private mode).
+5. Any incoming `location:update` events are **silently rejected** while paused.
+6. The user is **excluded from `location:snapshot`** results while paused.
+7. A `session:paused` acknowledgement is sent back to the caller.
 
 **Server Response:** Emits `session:paused` with `{ sessionId }`.
 
@@ -492,10 +497,12 @@ socket.emit("session:resume");
 
 **What happens internally:**
 1. The user's session is unflagged (`paused = false`).
-2. If the user has a last known location, a `user:online` event is broadcast to other users in the room (skipped in ghost/private mode).
+2. The user's **last known location is cleared** — they won't appear on the map until they send their first `location:update` after resume. This prevents the stale pre-pause location from reappearing.
 3. `location:update` events are accepted again.
-4. The user reappears in `location:snapshot` results (except in ghost/private mode).
+4. The user reappears in `location:snapshot` results after sending their first location update.
 5. A `session:resumed-active` acknowledgement is sent back to the caller.
+
+> ⚠️ **Changed behavior:** `user:online` is **not** broadcast on resume. The user reappears naturally when they send their first `location:update`. This prevents showing a stale pre-pause location marker.
 
 **Server Response:** Emits `session:resumed-active` with `{ sessionId }`.
 
@@ -515,9 +522,10 @@ socket.emit("discard-session");
 ```
 
 **What happens internally:**
-1. All location history (`session:{sessionId}:path`) for this session is **deleted** from Redis.
-2. The last known location (`session:{sessionId}:user:{userId}:last-location`) is **deleted** from Redis.
-3. The session is **ended** identically to `end-session` (removed from memory, `user:offline` broadcast to room — skipped in ghost/private mode).
+1. The in-memory path buffer is **cleared without flushing** — buffered data is thrown away.
+2. All location history (`session:{sessionId}:path`) for this session is **deleted** from Redis.
+3. The user's avatar cache (`user:{userId}:avatar`) is **deleted** from Redis.
+4. The session is **ended** identically to `end-session` (removed from memory, `user:offline` broadcast to room — skipped in ghost/private mode).
 
 **Error Handling:** Silently ignored if the socket is not in an active session.
 
@@ -800,9 +808,9 @@ interface UserHype {
 
 | Event | Direction | Payload (Input) | Response/Broadcast | When to Use |
 |-------|-----------|------------------|--------------------|-------------|
-| `join-room` | Client → Server | `roomId: string` | `location:snapshot` → caller | After connecting, join a tracking room |
+| `join-room` | Client → Server | `roomId: string` or `{ roomId, teamId? }` | `location:snapshot` → caller | After connecting, join a tracking room |
 | `leave-room` | Client → Server | `roomId: string` or `{ roomId, teamId? }` | `room:left` → caller, `user:offline` → room ¹ | Leave a previously joined room |
-| `start-session` | Client → Server | `{ roomId, sessionId, sessionMode? }` | — | When user starts a running session |
+| `start-session` | Client → Server | `{ roomId, sessionId, sessionMode?, teamId? }` | — | When user starts a running session |
 | `location:update` | Client → Server | `{ lat, lng, minute? }` | `location:update` → room (others) ¹ | During active session, share GPS location |
 | `end-session` | Client → Server | *none* | `user:offline` → room (others) ¹ | When user ends running session |
 | `discard-session` | Client → Server | *none* | `user:offline` → room (others) ¹ | When user wants to cancel and delete their session data entirely |
@@ -810,11 +818,11 @@ interface UserHype {
 | `location:sync-buffered` | Client → Server | `{ locations: [{ lat, lng, ts }, ...] }` | `location:sync-ack` → caller | After reconnect, send buffered locations |
 | `user:hype` | Client → Server | `{ targetUserId }` | `user:hype` → room (others) ¹ | Send a highfive/hype to a user |
 | **`session:pause`** | **Client → Server** | ***none*** | **`session:paused` → caller, `user:offline` → room** ¹ | **Temporarily stop sharing location** |
-| **`session:resume`** | **Client → Server** | ***none*** | **`session:resumed-active` → caller, `user:online` → room** ¹ | **Resume sharing location after pause** |
+| **`session:resume`** | **Client → Server** | ***none*** | **`session:resumed-active` → caller** | **Resume sharing location after pause** |
 | `location:snapshot` | Server → Client | — | `[{ userId, lat, lng, ts, avatarUrl }, ...]` | Sent after `join-room` (only connected, unpaused, non-stealth users) |
 | `location:update` | Server → Client | — | `{ userId, lat, lng, ts, avatarUrl }` | Real-time location from other users |
 | `user:offline` | Server → Client | — | `{ userId }` | **Immediately** when a user disconnects, ends session, leaves room, or **pauses** ¹ |
-| `user:online` | Server → Client | — | `{ userId, lat, lng, ts, avatarUrl }` | When a disconnected user reconnects or **resumes** ¹ |
+| `user:online` | Server → Client | — | `{ userId, lat, lng, ts, avatarUrl, teamId? }` | When a disconnected user reconnects ¹ |
 | `session:resumed` | Server → Client | — | `{ roomId, sessionId, location, disconnectedAt }` | Successful session reconnection |
 | `session:resume-failed` | Server → Client | — | `{ reason }` | Failed session reconnection |
 | `session:paused` | Server → Client | — | `{ sessionId }` | Acknowledgement that session is paused |
@@ -829,12 +837,20 @@ interface UserHype {
 
 ## 🗄️ Redis Data Model
 
-All location data is persisted in Redis with a **48-hour TTL**.
+All location data is persisted in Redis with a **72-hour TTL** (24h safety buffer beyond the 48h resume window).
 
 | Key Pattern | Type | TTL | Description |
 |-------------|------|-----|-------------|
-| `session:{sessionId}:path` | List (`RPUSH`) | 48 hours | Ordered list of **all** location points for a session. Each entry is a JSON string: `{"lat":..., "lng":..., "ts":..., "minute":...}` (the `minute` field is present only if the frontend sends it). Points are **buffered in memory** and flushed to Redis every 10 seconds. |
+| `session:{sessionId}:path` | List (`RPUSH`) | 72 hours | Ordered list of **all** location points for a session. Each entry is a JSON string: `{"lat":..., "lng":..., "ts":..., "minute":...}` (the `minute` field is present only if the frontend sends it). May also contain break markers: `{"type":"break","reason":"pause"|"disconnect","ts":...}`. Points are **buffered in memory** and flushed to Redis every 10 seconds. |
 | `user:{userId}:avatar` | String (`SET`) | 48 hours | The user's avatar URL. **Written by the HTTP backend** when a session is created. Read by the WS server once at `start-session` and cached in memory. Explicitly deleted on `discard-session`. |
+| `team:{teamId}:avatar` | String (`SET`) | 48 hours | Team avatar URL. **Written by the HTTP backend**. For team-mode sessions, the WS server checks this key first (falling back to the user avatar). |
+
+**Redis Pub/Sub:**
+
+| Channel | Direction | Payload | Description |
+|---------|-----------|---------|-------------|
+| `session:killed` | Backend → WS Server | `{ sessionId, userId }` | When the backend kills a session (e.g., via `completeActiveSessionsForUser`), it publishes to this channel. The WS server finalizes the matching in-memory session immediately. |
+| `session:finalized` | WS Server → Backend | `{ sessionId, userId, roomId }` | When the WS server autonomously finalizes a session (48h timeout, stale session cleanup via BUG-006, or `end-session`), it publishes to this channel. **The backend should subscribe and trigger its session completion pipeline** (area calculation, territory capture, etc.) before the Redis path data expires (72h TTL). |
 
 > 💡 The `session:{sessionId}:user:{userId}:last-location` key has been **removed**. The last known location is now tracked only in memory (`userData.location`). The backend only needs `session:{id}:path` (via `LRANGE`) at session end.
 
@@ -845,12 +861,16 @@ All location data is persisted in Redis with a **48-hour TTL**.
 session:12345:path → [
   '{"lat":40.785091,"lng":-73.968285,"ts":1706636270000,"minute":1}',
   '{"lat":40.785120,"lng":-73.968300,"ts":1706636272000,"minute":1}',
+  '{"type":"break","reason":"pause","ts":1706636290000}',
   '{"lat":40.785200,"lng":-73.968400,"ts":1706636332000,"minute":2}',
   ...
 ]
 
 # User avatar (string — written by HTTP backend at session creation)
 user:42:avatar → 'https://res.cloudinary.com/xxx/avatars/avatar3.jpg'
+
+# Team avatar (string — written by HTTP backend)
+team:5:avatar → 'https://res.cloudinary.com/xxx/teams/team5.jpg'
 ```
 
 ---
@@ -867,6 +887,7 @@ Map<roomId, Map<userId, ActiveUserSession>>
 
 ```typescript
 type SessionMode = 'normal' | 'ghost' | 'private';
+type SessionType = 'solo' | 'team';
 
 interface ActiveUserSession {
   sessionId: number;                              // Session ID from backend
@@ -876,6 +897,8 @@ interface ActiveUserSession {
   disconnectedAt: number | null;                  // Timestamp of last disconnect
   paused: boolean;                                // Whether the session is paused
   sessionMode: SessionMode;                       // 'normal', 'ghost', or 'private'
+  sessionType: SessionType;                       // 'solo' or 'team'
+  teamId: number | null;                          // Team ID (null for solo sessions)
   avatarUrl: string;                              // User's avatar URL (read from Redis at session start)
   pathBuffer: Location[];                         // Buffered location points (flushed to Redis every 10s)
   flushTimer: ReturnType<typeof setInterval> | null;  // Periodic flush timer
@@ -885,7 +908,7 @@ interface ActiveUserSession {
 ### `activeBySocket`
 
 ```
-Map<socketId, { roomId, userId, sessionId, sessionMode }>
+Map<socketId, { roomId, userId, sessionId, sessionMode, sessionType, teamId }>
 ```
 
 Quick lookup from a socket ID to its room/user/session context.
@@ -915,7 +938,7 @@ When a user disconnects (network drop, app backgrounded, etc.), the server does 
        │ NO
        ▼
 ┌──────────────────────────┐
-│  Start reconnect timer   │    Default: 30 seconds
+│  Start reconnect timer   │    Default: 48 hours
 │  (SESSION_RESUME_WINDOW) │
 └──────┬───────────────────┘
        │
@@ -977,7 +1000,7 @@ When a user disconnects (network drop, app backgrounded, etc.), the server does 
                        ▼
               ┌──────────────────┐
               │   GRACE PERIOD   │── reconnect-session ──▶ ACTIVE SESSION
-              │  (30s default)   │
+              │  (48h default)   │
               └────────┬─────────┘
                        │ timeout
                        ▼
@@ -1012,6 +1035,7 @@ interface StartSessionPayload {
   roomId: string;
   sessionId: number;
   sessionMode?: SessionMode;  // Optional — defaults to 'normal'
+  teamId?: number;            // Optional — if provided, session runs in team mode
 }
 
 // location:update (sending)
@@ -1044,6 +1068,7 @@ interface LocationPoint {
 interface UserLocation extends LocationPoint {
   userId: number;
   avatarUrl: string;
+  teamId?: number;  // Present for team-mode runners
 }
 type LocationSnapshotPayload = UserLocation[];
 
@@ -1054,6 +1079,7 @@ interface LocationUpdateReceivedPayload {
   lng: number;
   ts: number;
   avatarUrl: string;
+  teamId?: number;  // Present for team-mode runners
 }
 
 // user:offline
@@ -1068,6 +1094,7 @@ interface UserOnlinePayload {
   lng: number;
   ts: number;
   avatarUrl: string;
+  teamId?: number;  // Present for team-mode runners
 }
 
 // session:resumed
@@ -1343,11 +1370,17 @@ async function main() {
 10. **Redis TLS** — If your `REDIS_URL` starts with `rediss://`, TLS is automatically enabled with `rejectUnauthorized: false`.
 11. **Redis Retry** — The server retries Redis connections up to 10 times with exponential backoff (100ms → 3000ms), and auto-reconnects on `READONLY`, `ECONNRESET`, and `ETIMEDOUT` errors.
 12. **Session Modes** — `start-session` accepts an optional `sessionMode`: `"ghost"` or `"private"`. Both suppress **all** room broadcasts (`location:update`, `user:online`, `user:offline`) and exclude the user from `location:snapshot`. Data saving to Redis is **unchanged**. Note that the backend completes Ghost sessions with full territory capture, while Private sessions skip territory capture.
-13. **No Self-Events** — `user:online` and `user:offline` events from pause/resume/reconnect are sent only to **other** users in the room (via `socket.to()`), not to the user themselves.
-14. **Buffered Path Writes** — Location points are **not** written to Redis on every update. They are buffered in memory and flushed every 10 seconds (configurable via `FLUSH_INTERVAL_MS`). The buffer is flushed on `end-session`, `disconnect`, and session finalization. On `discard-session`, the buffer is **cleared without flushing**.
+13. **No Self-Events** — `user:online` and `user:offline` events from pause/reconnect are sent only to **other** users in the room (via `socket.to()`), not to the user themselves.
+14. **Buffered Path Writes** — Location points are **not** written to Redis on every update. They are buffered in memory and flushed every 10 seconds (configurable via `FLUSH_INTERVAL_MS`). The buffer is flushed on `end-session`, `disconnect`, `session:pause`, and session finalization. On `discard-session`, the buffer is **cleared without flushing**.
 15. **Consecutive Deduplication** — If a user sends a `location:update` with the same `lat`/`lng` as their last known position, it is silently skipped. This keeps path and area data clean by eliminating stationary noise.
 16. **No `last-location` Key** — The `session:{id}:user:{id}:last-location` Redis key has been removed. Last known location is tracked only in memory.
 17. **Active-Minute Counter** — The optional `minute` field in `location:update` enables per-minute speed analysis. The frontend should maintain a simple counter that starts at `1`, increments every 60 seconds of active running, and **freezes** during pauses. The backend groups path points by this counter and computes average speed per minute. Gaps in the minute sequence naturally indicate paused/disconnected periods.
+18. **Redis TTL is 72 hours** — Session path keys in Redis have a **72-hour TTL** (24h safety buffer beyond the 48h resume window). This prevents data loss if a user reconnects near the end of the grace period.
+19. **Segment Break Markers** — When a user pauses or disconnects, a break marker (`{"type":"break","reason":"pause"|"disconnect","ts":...}`) is inserted into the Redis path. The backend should split the path at these markers to get separate segments and avoid drawing false straight lines.
+20. **Resume Clears Location** — When resuming from a pause (`session:resume`), the user's last known location is **cleared**. They will not appear on the map or in `location:snapshot` until they send their first `location:update` after resume. This prevents stale pre-pause locations from reappearing.
+21. **Session Kill Pub/Sub** — The WS server subscribes to the Redis `session:killed` channel. When the backend kills a session (e.g., via `completeActiveSessionsForUser`), it should publish `{ sessionId, userId }` to this channel. The WS server finalizes the matching in-memory session immediately.
+22. **Stale Session Prevention** — When `start-session` is called, if the user has an existing in-memory session with a **different** `sessionId`, that stale session is immediately finalized. This prevents ghost sessions from lingering after a backend restart.
+23. **Sentry Error Tracking** — The server reports errors to Sentry in production (`NODE_ENV !== 'development'`). Set `SENTRY_DSN` to enable.
 
 ---
 
@@ -1359,6 +1392,7 @@ async function main() {
 | **Default Port** | `3000` |
 | **Bind Address** | `0.0.0.0` (all interfaces) |
 | **Authentication** | Clerk JWT via handshake `auth` or `headers` |
-| **Data Persistence** | Redis (TTL: 48 hours) |
+| **Data Persistence** | Redis (path TTL: 72 hours, avatar TTL: 48 hours) |
 | **Reconnect Grace Period** | 48 hours (configurable) |
+| **Error Tracking** | Sentry (production only) |
 | **HTTP Health Check** | `GET /` → `200 OK "Socket server is running"` |

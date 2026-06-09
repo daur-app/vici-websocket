@@ -44,3 +44,16 @@ export function clearFlushTimer(userData: ActiveUserSession): void {
     userData.flushTimer = null;
   }
 }
+
+/**
+ * Find a user's active session entry across all rooms (in-memory).
+ * Used by BUG-004 (Pub/Sub kill handler) and BUG-006 (stale session cleanup).
+ * Returns { roomId, userData } or null if not found.
+ */
+export function findUserAcrossRooms(userId: number): { roomId: string; userData: ActiveUserSession } | null {
+  for (const [roomId, roomMap] of activeUsersByRoom) {
+    const userData = roomMap.get(userId);
+    if (userData) return { roomId, userData };
+  }
+  return null;
+}

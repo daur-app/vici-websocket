@@ -42,18 +42,22 @@ Allows a user to **temporarily stop sharing their location** without ending the 
 ### On Pause (`session:pause`)
 
 1. The user's session is flagged as `paused = true`.
-2. `user:offline` is broadcast to other users in the room → **markers are removed** (suppressed in ghost/private mode, sent via `socket.to()` so the user does not receive their own offline event).
-3. Any incoming `location:update` events from this user are **silently rejected**.
-4. The user is **excluded from `location:snapshot`** results (new joiners won't see them).
-5. `session:paused` acknowledgement is sent back to the caller.
+2. The in-memory path buffer is **flushed** to Redis.
+3. A **segment break marker** is inserted into the Redis path (prevents false connecting lines).
+4. `user:offline` is broadcast to other users in the room → **markers are removed** (suppressed in ghost/private mode, sent via `socket.to()` so the user does not receive their own offline event).
+5. Any incoming `location:update` events from this user are **silently rejected**.
+6. The user is **excluded from `location:snapshot`** results (new joiners won't see them).
+7. `session:paused` acknowledgement is sent back to the caller.
 
 ### On Resume (`session:resume`)
 
 1. The user's session is unflagged (`paused = false`).
-2. If the user has a last known location, `user:online` is broadcast to other users → **marker reappears** (suppressed in ghost/private mode, sent via `socket.to()` so the user does not receive their own online event).
+2. The user's **last known location is cleared** — they will not appear on the map until they send their first `location:update` after resume.
 3. `location:update` events are accepted again.
-4. The user reappears in `location:snapshot` results.
+4. The user reappears in `location:snapshot` results after sending their first location update.
 5. `session:resumed-active` acknowledgement is sent back to the caller.
+
+> ⚠️ `user:online` is **not** broadcast on resume. The user reappears naturally when they send their first `location:update`. This prevents showing a stale pre-pause location marker.
 
 ### Edge Cases
 
@@ -145,14 +149,26 @@ socket.on("user:online", (data) => {
 
 ## Changes Made
 
-### `src/index.ts`
+### `src/handlers/sessionHandlers.ts`
+
+- New `session:pause` handler — sets `paused = true`, flushes path buffer, inserts break marker, broadcasts `user:offline` (via `socket.to()`, suppressed in stealth mode), sends ack.
+- New `session:resume` handler — clears `paused` flag, **clears last known location** (user reappears only after sending a fresh `location:update`), sends ack. Does **not** broadcast `user:online` (prevents stale pre-pause marker).
+
+### `src/handlers/locationHandlers.ts`
+
+- `location:update` handler rejects updates when `paused === true`.
+
+### `src/handlers/roomHandlers.ts`
+
+- `location:snapshot` excludes paused users from the snapshot.
+
+### `src/session/lifecycle.ts`
+
+- `attachSocketToSession` resets `paused = false` on reconnect.
+
+### `src/types/session.ts`
 
 - Added `paused: boolean` to `ActiveUserSession` type.
-- `location:update` handler rejects updates when `paused === true`.
-- `location:snapshot` excludes paused users from the snapshot.
-- New `session:pause` handler — sets flag, broadcasts `user:offline` (via `socket.to()`, suppressed in stealth mode), sends ack.
-- New `session:resume` handler — clears flag, broadcasts `user:online` (via `socket.to()`, suppressed in stealth mode), sends ack.
-- `attachSocketToSession` resets `paused = false` on reconnect.
 
 ### `FRONTEND_INTEGRATION.md`
 

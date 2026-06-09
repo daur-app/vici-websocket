@@ -4,7 +4,7 @@ import { createServer } from "http";
 import { Server } from "socket.io";
 import socketAuth from "./middelware/authmiddleware";
 import { setIO } from "./session/lifecycle";
-import { detachSocket } from "./session/lifecycle";
+import { detachSocket, initSessionKilledSubscriber } from "./session/lifecycle";
 import { registerRoomHandlers } from "./handlers/roomHandlers";
 import { registerSessionHandlers } from "./handlers/sessionHandlers";
 import { registerLocationHandlers } from "./handlers/locationHandlers";
@@ -26,6 +26,9 @@ io.use(socketAuth);
 
 // Inject the io reference into the session lifecycle module
 setIO(io);
+
+// BUG-004 FIX: Start listening for session-kill notifications from the backend
+initSessionKilledSubscriber();
 
 // ─── Connection handler ─────────────────────────────────────────────────────
 
